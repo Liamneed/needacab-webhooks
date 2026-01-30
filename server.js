@@ -28,7 +28,9 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // ---- Request logging ----
 app.use((req, res, next) => {
-  console.log(`[REQ] ${req.method} ${req.originalUrl} ct=${req.headers["content-type"] || ""}`);
+  console.log(
+    `[REQ] ${req.method} ${req.originalUrl} ct=${req.headers["content-type"] || ""}`
+  );
   next();
 });
 
@@ -223,36 +225,44 @@ function eventMatchesTextToken(evt, tokenLower) {
   return stringifySafe(evt).toLowerCase().includes(tokenLower);
 }
 
+// ---- Path helper for dropdown field search ----
+// Supports selecting "payload.Driver.Callsign" etc
+function getByPath(obj, pathStr) {
+  if (!obj || !pathStr) return undefined;
+  const parts = pathStr.split(".").filter(Boolean);
+  let cur = obj;
+  for (const p of parts) {
+    if (cur == null) return undefined;
+    cur = cur[p];
+  }
+  return cur;
+}
+
 // ---- New: UI field selector search ----
-// field="" or "any" => search anywhere in the event
-// otherwise search ONLY values under keys matching that field name (case-insensitive)
-function eventMatchesSelectedField(evt, fieldName, value) {
+// field="any" => search anywhere in the event
+// field="fulltext" => also search anywhere (same behaviour)
+// otherwise field is a JSON path like "payload.Driver.Callsign"
+function eventMatchesSelectedField(evt, fieldPath, value) {
   const v = (value || "").toString().trim().toLowerCase();
   if (!v) return true;
 
-  const f = (fieldName || "").toString().trim().toLowerCase();
+  const f = (fieldPath || "").toString().trim();
   if (!f || f === "any" || f === "fulltext") {
     return stringifySafe(evt).toLowerCase().includes(v);
   }
 
-  // search only where the key matches selected field
-  return deepAny(evt, (key, val) => {
-    if (!key) return false;
-    if (String(key).toLowerCase() !== f) return false;
-    return stringifySafe(val).toLowerCase().includes(v);
-  });
+  const got = getByPath(evt, f);
+  return stringifySafe(got).toLowerCase().includes(v);
 }
 
 // Combined query matcher:
-// - supports new UI params: field + value
+// - supports dropdown field + value
 // - also supports old q tokens (key:value + free text) for power users
 function eventMatches(evt, { q, field, value }) {
-  // First apply field/value filter (if provided)
   if (value && value.trim()) {
     if (!eventMatchesSelectedField(evt, field, value)) return false;
   }
 
-  // Then apply token query (if q provided)
   const qq = normalizeQ(q);
   if (!qq) return true;
 
@@ -267,98 +277,113 @@ function eventMatches(evt, { q, field, value }) {
 }
 
 // ---- Summary extraction for list rows ----
-// Goal: show bookingId/callsign/driverId/vehicleId etc when present.
+// Updated for Autocab payloads (PascalCase + nested Driver/Vehicle/Pickup/Destination)
 const COMMON_FIELDS = [
-  { label: "BookingId", key: "bookingId" },
-  { label: "BookingID", key: "bookingID" },
-  { label: "Id", key: "id" },
-  { label: "JobId", key: "jobId" },
-  { label: "JobID", key: "jobID" },
-  { label: "Callsign", key: "callsign" },
-  { label: "CallSign", key: "callSign" },
-  { label: "DriverId", key: "driverId" },
-  { label: "VehicleId", key: "vehicleId" },
-  { label: "Vehicle", key: "vehicle" },
-  { label: "Driver", key: "driver" },
-  { label: "Ref", key: "reference" },
-  { label: "Reference", key: "ref" },
-  { label: "Status", key: "status" },
-  { label: "Event", key: "event" },
-  { label: "Type", key: "type" },
+  { label: "Booking Id (payload.Id)", path: "payload.Id" },
+  { label: "OriginalBookingId", path: "payload.OriginalBookingId" },
+  { label: "EventType", path: "payload.EventType" },
+  { label: "BookingType", path: "payload.BookingType" },
+  { label: "TypeOfBooking", path: "payload.TypeOfBooking" },
+
+  { label: "Driver Callsign", path: "payload.Driver.Callsign" },
+  { label: "Driver Id", path: "payload.Driver.Id" },
+  { label: "Driver Forename", path: "payload.Driver.Forename" },
+  { label: "Driver Surname", path: "payload.Driver.Surname" },
+
+  { label: "Vehicle Callsign", path: "payload.Vehicle.Callsign" },
+  { label: "Vehicle Id", path: "payload.Vehicle.Id" },
+  { label: "Vehicle Registration", path: "payload.Vehicle.Registration" },
+  { label: "Vehicle PlateNumber", path: "payload.Vehicle.PlateNumber" },
+
+  { label: "Pickup Address", path: "payload.Pickup.Address" },
+  { label: "Pickup Zone", path: "payload.Pickup.Zone.Name" },
+  { label: "Destination Address", path: "payload.Destination.Address" },
+  { label: "Destination Zone", path: "payload.Destination.Zone.Name" },
+
+  { label: "PaymentType", path: "payload.PaymentType" },
+  { label: "Pricing Cost", path: "payload.Pricing.Cost" },
+  { label: "Pricing Price", path: "payload.Pricing.Price" },
+  { label: "Distance", path: "payload.Distance" },
+  { label: "BookingSource", path: "payload.BookingSource" },
+
+  { label: "CabExchangeAgentBookingRef", path: "payload.CabExchangeAgentBookingRef" },
 ];
 
-function pickFirstValueByKey(obj, keyLower) {
-  let found = null;
-  deepAny(obj, (k, v) => {
-    if (found != null) return true;
-    if (!k) return false;
-    if (String(k).toLowerCase() !== keyLower) return false;
-
-    // avoid dumping whole objects as the summary value
-    if (v && typeof v === "object") {
-      const s = stringifySafe(v);
-      found = s.length > 120 ? s.slice(0, 120) + "…" : s;
-      return true;
-    }
-    found = String(v);
-    return true;
-  });
-  return found;
+function short(s, n = 80) {
+  const t = (s ?? "").toString();
+  return t.length > n ? t.slice(0, n) + "…" : t;
 }
 
 function buildSummary(evt) {
-  const payload = evt?.payload ?? {};
-  const meta = evt?.meta ?? {};
-
+  const p = evt?.payload ?? {};
   const parts = [];
 
-  // strong identifiers first
-  const bookingId =
-    pickFirstValueByKey(payload, "bookingid") ||
-    pickFirstValueByKey(payload, "booking_id") ||
-    pickFirstValueByKey(payload, "id");
+  const id = p.Id ?? p.OriginalBookingId ?? "";
+  const eventType = p.EventType ?? "";
+  const bookingType = p.BookingType ?? "";
+  const typeOfBooking = p.TypeOfBooking ?? "";
 
-  const jobId =
-    pickFirstValueByKey(payload, "jobid") ||
-    pickFirstValueByKey(payload, "job_id");
+  const driverCs = p?.Driver?.Callsign ?? p?.DriverDetails?.Driver?.Callsign ?? "";
+  const driverId = p?.Driver?.Id ?? p?.DriverDetails?.Driver?.Id ?? "";
 
-  const callsign =
-    pickFirstValueByKey(payload, "callsign") ||
-    pickFirstValueByKey(payload, "callsignnumber") ||
-    pickFirstValueByKey(payload, "callsignno") ||
-    pickFirstValueByKey(payload, "callsign") ||
-    pickFirstValueByKey(payload, "callsign");
+  const vehCs = p?.Vehicle?.Callsign ?? p?.VehicleDetails?.Vehicle?.Callsign ?? "";
+  const vehId = p?.Vehicle?.Id ?? p?.VehicleDetails?.Vehicle?.Id ?? "";
+  const reg = p?.Vehicle?.Registration ?? "";
+  const plate = p?.Vehicle?.PlateNumber ?? "";
 
-  const driverId = pickFirstValueByKey(payload, "driverid");
-  const vehicleId = pickFirstValueByKey(payload, "vehicleid");
+  const pickupZone = p?.Pickup?.Zone?.Name ?? p?.Pickup?.Zone?.Descriptor ?? "";
+  const pickupAddr = p?.Pickup?.Address ?? "";
+  const destZone = p?.Destination?.Zone?.Name ?? p?.Destination?.Zone?.Descriptor ?? "";
+  const destAddr = p?.Destination?.Address ?? "";
 
-  const status = pickFirstValueByKey(payload, "status");
-  const eventType = pickFirstValueByKey(payload, "event") || pickFirstValueByKey(payload, "type");
+  const pay = p?.PaymentType ?? "";
+  const cost = p?.Pricing?.Cost ?? "";
+  const price = p?.Pricing?.Price ?? "";
+  const dist = p?.Distance ?? p?.SystemDistance ?? "";
 
-  if (bookingId) parts.push(`Booking ${bookingId}`);
-  if (jobId && (!bookingId || String(jobId) !== String(bookingId))) parts.push(`Job ${jobId}`);
-  if (callsign) parts.push(`CS ${callsign}`);
-  if (driverId) parts.push(`Driver ${driverId}`);
-  if (vehicleId) parts.push(`Veh ${vehicleId}`);
-  if (status) parts.push(`Status ${status}`);
-  if (eventType) parts.push(String(eventType));
+  const eta = p?.EstimatedPickupTime ?? "";
+  const arrived = p?.VehicleArrivedAtTime ?? "";
+  const dispatched = p?.DispatchedAtTime ?? "";
 
-  // fallback if nothing found
-  if (!parts.length) {
-    if (payload && typeof payload === "object") {
-      const keys = Object.keys(payload).slice(0, 6);
-      if (keys.length) parts.push(`Keys: ${keys.join(", ")}`);
-    } else {
-      parts.push("(payload)");
-    }
+  if (id) parts.push(`Booking ${id}`);
+  if (eventType) parts.push(eventType);
+  if (bookingType) parts.push(bookingType);
+  if (typeOfBooking) parts.push(typeOfBooking);
+
+  const dv = [];
+  if (driverCs) dv.push(`D CS ${driverCs}`);
+  if (driverId !== "") dv.push(`D#${driverId}`);
+  if (vehCs) dv.push(`V CS ${vehCs}`);
+  if (vehId !== "") dv.push(`V#${vehId}`);
+  if (reg) dv.push(reg);
+  if (plate) dv.push(`Plate ${plate}`);
+  if (dv.length) parts.push(dv.join(" "));
+
+  if (pickupAddr || destAddr) {
+    const leg =
+      `${pickupZone ? pickupZone + ": " : ""}${short(pickupAddr, 46)} → ` +
+      `${destZone ? destZone + ": " : ""}${short(destAddr, 46)}`;
+    parts.push(leg);
   }
 
-  // tiny meta hint
-  const ct = meta?.contentType ? String(meta.contentType) : "";
-  return {
-    summary: parts.join(" · "),
-    contentType: ct,
-  };
+  const money = [];
+  if (pay) money.push(pay);
+  if (cost !== "") money.push(`Cost ${cost}`);
+  if (price !== "") money.push(`Price ${price}`);
+  if (dist !== "") money.push(`${dist}mi`);
+  if (money.length) parts.push(money.join(" · "));
+  const times = [];
+  if (dispatched) times.push(`Disp ${dispatched}`);
+  if (arrived) times.push(`Arr ${arrived}`);
+  if (eta) times.push(`ETA ${eta}`);
+  if (times.length) parts.push(times.join(" · "));
+
+  if (!parts.length && p && typeof p === "object") {
+    const keys = Object.keys(p).slice(0, 8);
+    parts.push(`Keys: ${keys.join(", ")}`);
+  }
+
+  return { summary: parts.join(" | ") };
 }
 
 // ---- Helpers: limits ----
@@ -417,13 +442,12 @@ app.get("/api/hooks", (req, res) => {
 
 // Provide list of common fields for dropdown (UI)
 app.get("/api/fields", (req, res) => {
-  // return unique labels/keys
   res.json({
     ok: true,
     fields: [
       { label: "Any field (recommended)", value: "any" },
       { label: "Full text (entire JSON)", value: "fulltext" },
-      ...COMMON_FIELDS.map((f) => ({ label: f.label, value: f.key })),
+      ...COMMON_FIELDS.map((f) => ({ label: f.label, value: f.path })),
     ],
   });
 });
@@ -445,7 +469,6 @@ app.get("/api/hooks/:hook", (req, res) => {
     filtered = arr.filter((evt) => eventMatches(evt, { q, field, value }));
   }
 
-  // attach summaries for UI rows
   const items = (limit === 0 ? filtered : filtered.slice(0, Math.min(5000, limit))).map((evt) => {
     const { summary } = buildSummary(evt);
     return { ...evt, _summary: summary };
@@ -491,7 +514,9 @@ app.get("/api/events", (req, res) => {
     filtered = combined.filter((evt) => eventMatches(evt, { q, field, value }));
   }
 
-  filtered.sort((a, b) => (a.receivedAt < b.receivedAt ? 1 : a.receivedAt > b.receivedAt ? -1 : 0));
+  filtered.sort((a, b) =>
+    a.receivedAt < b.receivedAt ? 1 : a.receivedAt > b.receivedAt ? -1 : 0
+  );
   const sliced = limit === 0 ? filtered : filtered.slice(0, Math.min(5000, limit));
 
   const items = sliced.map((evt) => {
@@ -527,7 +552,9 @@ app.get("/api/export.ndjson", (req, res) => {
   }
 
   if (q || (value && value.trim())) events = events.filter((evt) => eventMatches(evt, { q, field, value }));
-  events.sort((a, b) => (a.receivedAt < b.receivedAt ? 1 : a.receivedAt > b.receivedAt ? -1 : 0));
+  events.sort((a, b) =>
+    a.receivedAt < b.receivedAt ? 1 : a.receivedAt > b.receivedAt ? -1 : 0
+  );
   if (events.length > MAX_EXPORT) events = events.slice(0, MAX_EXPORT);
 
   res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
@@ -554,7 +581,9 @@ app.get("/api/export.csv", (req, res) => {
   }
 
   if (q || (value && value.trim())) events = events.filter((evt) => eventMatches(evt, { q, field, value }));
-  events.sort((a, b) => (a.receivedAt < b.receivedAt ? 1 : a.receivedAt > b.receivedAt ? -1 : 0));
+  events.sort((a, b) =>
+    a.receivedAt < b.receivedAt ? 1 : a.receivedAt > b.receivedAt ? -1 : 0
+  );
   if (events.length > MAX_EXPORT) events = events.slice(0, MAX_EXPORT);
 
   const header = ["receivedAt", "id", "hook", "ip", "contentType", "userAgent", "payloadJson"];
@@ -680,12 +709,12 @@ app.get("/dashboard", (req, res) => {
 
         <div class="kv">
           <label>Value</label>
-          <input id="value" class="search" type="text" placeholder="e.g. 148"/>
+          <input id="value" class="search" type="text" placeholder="e.g. 51"/>
         </div>
 
         <div class="kv">
           <label>Advanced</label>
-          <input id="q" class="search" type="text" placeholder='Optional: bookingId:14012345 status:"cancelled"'/>
+          <input id="q" class="search" type="text" placeholder='Optional: driverId:57 pickup:"Market Ave"'/>
         </div>
 
         <div class="kv">
@@ -703,8 +732,8 @@ app.get("/dashboard", (req, res) => {
       </div>
 
       <div class="muted" style="margin-top:8px">
-        Field dropdown searches only that JSON key (case-insensitive). Advanced supports tokens like
-        <span class="pill">bookingId:14012345</span> <span class="pill">driverId:416</span> <span class="pill">pickup:"Royal Parade"</span>
+        Field dropdown searches the selected JSON path (e.g. payload.Driver.Callsign). Advanced supports tokens like
+        <span class="pill">Id:12798732</span> <span class="pill">Callsign:51</span> <span class="pill">Pickup:"Market Ave"</span>
       </div>
     </div>
   </header>
@@ -922,7 +951,6 @@ app.get("/dashboard", (req, res) => {
     currentSelectedJson = JSON.stringify(item, null, 2);
     document.getElementById('detail').textContent = currentSelectedJson;
 
-    // If in single-hook mode, fetch canonical item
     if (selectedHook !== '*' && selectedHook) {
       try {
         const res = await fetch('/api/hooks/' + encodeURIComponent(selectedHook) + '/' + encodeURIComponent(item.id), { cache: 'no-store' });
@@ -966,7 +994,6 @@ app.get("/dashboard", (req, res) => {
     document.getElementById('detail').textContent = 'Select an event…';
     setStatus('Cleared ' + label);
 
-    // refresh hooks list (some may disappear)
     await loadHooks();
     updateUrl();
     updateDownloadLinks();
