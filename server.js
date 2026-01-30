@@ -18,7 +18,6 @@ const HOOK_ALLOWLIST = (process.env.HOOK_ALLOWLIST || "")
 
 function isHookAllowed(hook) {
   if (!hook) return false;
-  // only allow letters, numbers, dash, underscore
   if (!/^[a-zA-Z0-9_-]{1,40}$/.test(hook)) return false;
   if (HOOK_ALLOWLIST.length === 0) return true;
   return HOOK_ALLOWLIST.includes(hook);
@@ -47,7 +46,6 @@ app.use(
 );
 
 // ---- Storage (per hook) ----
-// In-memory: { [hook]: [events...] }
 const recentByHook = new Map();
 
 function hookFile(hook) {
@@ -108,43 +106,161 @@ function listHooksOnDisk() {
   }
 }
 
-// ---- Search helpers ----
-function normalizeQ(q) {
-  const s = (q || "").toString().trim();
-  return s.length ? s : "";
-}
-
-function eventMatchesQ(evt, qLower) {
-  if (!qLower) return true;
-
-  // Search across: id, hook, receivedAt, meta values, payload JSON
-  const metaStr = JSON.stringify(evt.meta || {});
-  const payloadStr = (() => {
-    try {
-      return typeof evt.payload === "string" ? evt.payload : JSON.stringify(evt.payload || {});
-    } catch {
-      return String(evt.payload || "");
-    }
-  })();
-
-  const haystack =
-    `${evt.id} ${evt.hook} ${evt.receivedAt} ${metaStr} ${payloadStr}`.toLowerCase();
-
-  return haystack.includes(qLower);
-}
-
+// ---- Search helpers (field-aware) ----
 function csvEscape(value) {
   const s = value == null ? "" : String(value);
   if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
   return s;
 }
 
+function normalizeQ(q) {
+  const s = (q || "").toString().trim();
+  return s.length ? s : "";
+}
+
+// Tokenizer supporting quotes and key:value
+function tokenizeQuery(q) {
+  // Splits by spaces, but keeps quoted substrings together
+  // Examples:
+  //  bookingId:123 pickup:"Royal Parade" foo
+  const tokens = [];
+  let i = 0;
+  while (i < q.length) {
+    while (i < q.length && /\s/.test(q[i])) i++;
+    if (i >= q.length) break;
+
+    let start = i;
+    let inQuotes = false;
+    let quoteChar = null;
+
+    while (i < q.length) {
+      const ch = q[i];
+      if (!inQuotes && (ch === '"' || ch === "'")) {
+        inQuotes = true;
+        quoteChar = ch;
+        i++;
+        continue;
+      }
+      if (inQuotes && ch === quoteChar) {
+        inQuotes = false;
+        quoteChar = null;
+        i++;
+        continue;
+      }
+      if (!inQuotes && /\s/.test(ch)) break;
+      i++;
+    }
+
+    const raw = q.slice(start, i).trim();
+    if (raw) tokens.push(raw);
+  }
+  return tokens;
+}
+
+function parseTokens(q) {
+  const tokens = tokenizeQuery(q);
+
+  const fieldTokens = [];
+  const textTokens = [];
+
+  for (const t of tokens) {
+    const idx = t.indexOf(":");
+    if (idx > 0) {
+      const key = t.slice(0, idx).trim();
+      let value = t.slice(idx + 1).trim();
+
+      // strip surrounding quotes in value
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+
+      if (key && value) {
+        fieldTokens.push({ key: key.toLowerCase(), value: value.toLowerCase() });
+        continue;
+      }
+    }
+
+    // normal free-text token; strip quotes
+    let v = t.trim();
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+      v = v.slice(1, -1);
+    }
+    if (v) textTokens.push(v.toLowerCase());
+  }
+
+  return { fieldTokens, textTokens };
+}
+
+function stringifySafe(x) {
+  try {
+    if (typeof x === "string") return x;
+    return JSON.stringify(x);
+  } catch {
+    return String(x);
+  }
+}
+
+// Walk any object/array, return true if predicate(fieldName, value) matches anywhere
+function deepAny(obj, predicate) {
+  const stack = [{ value: obj, key: null }];
+
+  while (stack.length) {
+    const { value, key } = stack.pop();
+
+    if (predicate(key, value)) return true;
+
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) {
+        stack.push({ value: value[i], key });
+      }
+    } else if (value && typeof value === "object") {
+      for (const [k, v] of Object.entries(value)) {
+        stack.push({ value: v, key: k });
+      }
+    }
+  }
+
+  return false;
+}
+
+function eventMatchesFieldToken(evt, keyLower, valueLower) {
+  // Match key anywhere in event object (id/hook/receivedAt/meta/payload etc.)
+  return deepAny(evt, (field, val) => {
+    if (!field) return false;
+    if (String(field).toLowerCase() !== keyLower) return false;
+
+    const s = stringifySafe(val).toLowerCase();
+    return s.includes(valueLower);
+  });
+}
+
+function eventMatchesTextToken(evt, tokenLower) {
+  // Free-text searches across entire event JSON
+  const hay = stringifySafe(evt).toLowerCase();
+  return hay.includes(tokenLower);
+}
+
+function eventMatchesQuery(evt, q) {
+  const { fieldTokens, textTokens } = parseTokens(q);
+
+  // AND logic: all field tokens must match, all text tokens must match
+  for (const ft of fieldTokens) {
+    if (!eventMatchesFieldToken(evt, ft.key, ft.value)) return false;
+  }
+  for (const tt of textTokens) {
+    if (!eventMatchesTextToken(evt, tt)) return false;
+  }
+  return true;
+}
+
 // ---- Webhook receiver (ANY hook) ----
-// Autocab can POST to: /tracks, /modify, /cancel, etc.
 app.post("/:hook", (req, res) => {
   const hook = (req.params.hook || "").trim();
 
-  // Don't allow posting to internal paths
+  // prevent collisions with internal routes
   if (hook === "api" || hook === "dashboard") {
     return res.status(404).json({ ok: false, error: "Unknown webhook" });
   }
@@ -161,7 +277,6 @@ app.post("/:hook", (req, res) => {
 
   let payload = req.body;
 
-  // If body arrived as text, try parse JSON; otherwise store raw
   if (typeof payload === "string") {
     const trimmed = payload.trim();
     if (trimmed) {
@@ -187,17 +302,15 @@ app.get("/api/hooks", (req, res) => {
   res.json({ ok: true, hooks });
 });
 
-// list events for a hook, supports q= search
 app.get("/api/hooks/:hook", (req, res) => {
   const hook = (req.params.hook || "").trim();
   if (!isHookAllowed(hook)) return res.status(404).json({ ok: false, error: "Not found" });
 
   const limit = Math.max(1, Math.min(200, Number(req.query.limit || 50)));
   const q = normalizeQ(req.query.q);
-  const qLower = q.toLowerCase();
 
   const arr = ensureHookLoaded(hook);
-  const filtered = q ? arr.filter((evt) => eventMatchesQ(evt, qLower)) : arr;
+  const filtered = q ? arr.filter((evt) => eventMatchesQuery(evt, q)) : arr;
 
   res.json({ ok: true, hook, q, count: filtered.length, items: filtered.slice(0, limit) });
 });
@@ -218,13 +331,15 @@ app.get("/api/hooks/:hook/export.ndjson", (req, res) => {
   if (!isHookAllowed(hook)) return res.status(404).send("Not found");
 
   const q = normalizeQ(req.query.q);
-  const qLower = q.toLowerCase();
 
   const arr = ensureHookLoaded(hook);
-  const filtered = q ? arr.filter((evt) => eventMatchesQ(evt, qLower)) : arr;
+  const filtered = q ? arr.filter((evt) => eventMatchesQuery(evt, q)) : arr;
 
   res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
-  res.setHeader("Content-Disposition", `attachment; filename="${hook}${q ? "-filtered" : ""}.ndjson"`);
+  res.setHeader(
+    "Content-Disposition",
+    `attachment; filename="${hook}${q ? "-filtered" : ""}.ndjson"`
+  );
   res.send(filtered.map((e) => JSON.stringify(e)).join("\n") + (filtered.length ? "\n" : ""));
 });
 
@@ -234,18 +349,15 @@ app.get("/api/hooks/:hook/export.csv", (req, res) => {
   if (!isHookAllowed(hook)) return res.status(404).send("Not found");
 
   const q = normalizeQ(req.query.q);
-  const qLower = q.toLowerCase();
 
   const arr = ensureHookLoaded(hook);
-  const filtered = q ? arr.filter((evt) => eventMatchesQ(evt, qLower)) : arr;
+  const filtered = q ? arr.filter((evt) => eventMatchesQuery(evt, q)) : arr;
 
   const header = ["receivedAt", "id", "hook", "ip", "contentType", "userAgent", "payloadJson"];
   const rows = [header.join(",")];
 
   for (const e of filtered) {
-    const payloadJson =
-      typeof e.payload === "string" ? e.payload : (() => { try { return JSON.stringify(e.payload ?? {}); } catch { return String(e.payload ?? ""); } })();
-
+    const payloadJson = stringifySafe(e.payload ?? {});
     rows.push(
       [
         csvEscape(e.receivedAt),
@@ -260,7 +372,10 @@ app.get("/api/hooks/:hook/export.csv", (req, res) => {
   }
 
   res.setHeader("Content-Type", "text/csv; charset=utf-8");
-  res.setHeader("Content-Disposition", `attachment; filename="${hook}${q ? "-filtered" : ""}.csv"`);
+  res.setHeader(
+    "Content-Disposition",
+    `attachment; filename="${hook}${q ? "-filtered" : ""}.csv"`
+  );
   res.send(rows.join("\n") + "\n");
 });
 
@@ -291,7 +406,7 @@ app.get("/dashboard", (req, res) => {
     button:hover,a.btn:hover{background:#202836}
     input,select{background:#0f1319;border:1px solid #2a3340;color:#e9eef4;padding:8px 10px;border-radius:10px}
     input{width:160px}
-    input.search{width:260px}
+    input.search{width:340px}
     .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#1b222c;border:1px solid #2a3340;font-size:12px;color:#cfe1f3}
     .kv{display:flex;gap:10px;align-items:center}
     .kv label{font-size:12px;color:#9bb0c2}
@@ -315,7 +430,7 @@ app.get("/dashboard", (req, res) => {
 
         <div class="kv">
           <label>Search</label>
-          <input id="q" class="search" type="text" placeholder="bookingId / jobId / driverId / any text"/>
+          <input id="q" class="search" type="text" placeholder="bookingId:14012345 driverId:416 status:cancelled"/>
         </div>
 
         <div class="kv">
@@ -331,8 +446,9 @@ app.get("/dashboard", (req, res) => {
       </div>
 
       <div class="muted" style="margin-top:8px">
-        Receiver endpoints: <span class="pill">POST /{hook}</span>
-        e.g. <span class="pill">/tracks</span> <span class="pill">/modify</span>
+        Field-aware search: <span class="pill">bookingId:14012345</span>
+        <span class="pill">driverId:416</span>
+        <span class="pill">pickup:"Royal Parade"</span>
       </div>
     </div>
   </header>
@@ -372,10 +488,7 @@ app.get("/dashboard", (req, res) => {
   function setCount(txt){ document.getElementById('count').textContent = txt || ''; }
   function setHookPill(h){ document.getElementById('hookPill').textContent = '/' + (h || ''); }
 
-  function getQ(){
-    const v = (document.getElementById('q').value || '').trim();
-    return v;
-  }
+  function getQ(){ return (document.getElementById('q').value || '').trim(); }
 
   function updateDownloadLinks(){
     if (!selectedHook) return;
@@ -463,7 +576,7 @@ app.get("/dashboard", (req, res) => {
     list.innerHTML = '';
 
     if (!data.ok || !data.items?.length) {
-      list.innerHTML = '<div class="row"><div>No payloads for this webhook yet.</div><div class="muted">Autocab needs to POST to /' + selectedHook + '</div></div>';
+      list.innerHTML = '<div class="row"><div>No payloads for this webhook yet.</div><div class="muted">Try a different webhook, or check Autocab is posting.</div></div>';
       setCount('');
       setStatus('Ready');
       return;
@@ -517,7 +630,6 @@ app.get("/dashboard", (req, res) => {
     try {
       await navigator.clipboard.writeText(currentSelectedJson);
     } catch {
-      // fallback
       const ta = document.createElement('textarea');
       ta.value = currentSelectedJson;
       document.body.appendChild(ta);
