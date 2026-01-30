@@ -372,6 +372,7 @@ function buildSummary(evt) {
   if (price !== "") money.push(`Price ${price}`);
   if (dist !== "") money.push(`${dist}mi`);
   if (money.length) parts.push(money.join(" · "));
+
   const times = [];
   if (dispatched) times.push(`Disp ${dispatched}`);
   if (arrived) times.push(`Arr ${arrived}`);
@@ -514,9 +515,7 @@ app.get("/api/events", (req, res) => {
     filtered = combined.filter((evt) => eventMatches(evt, { q, field, value }));
   }
 
-  filtered.sort((a, b) =>
-    a.receivedAt < b.receivedAt ? 1 : a.receivedAt > b.receivedAt ? -1 : 0
-  );
+  filtered.sort((a, b) => (a.receivedAt < b.receivedAt ? 1 : a.receivedAt > b.receivedAt ? -1 : 0));
   const sliced = limit === 0 ? filtered : filtered.slice(0, Math.min(5000, limit));
 
   const items = sliced.map((evt) => {
@@ -552,9 +551,7 @@ app.get("/api/export.ndjson", (req, res) => {
   }
 
   if (q || (value && value.trim())) events = events.filter((evt) => eventMatches(evt, { q, field, value }));
-  events.sort((a, b) =>
-    a.receivedAt < b.receivedAt ? 1 : a.receivedAt > b.receivedAt ? -1 : 0
-  );
+  events.sort((a, b) => (a.receivedAt < b.receivedAt ? 1 : a.receivedAt > b.receivedAt ? -1 : 0));
   if (events.length > MAX_EXPORT) events = events.slice(0, MAX_EXPORT);
 
   res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
@@ -581,9 +578,7 @@ app.get("/api/export.csv", (req, res) => {
   }
 
   if (q || (value && value.trim())) events = events.filter((evt) => eventMatches(evt, { q, field, value }));
-  events.sort((a, b) =>
-    a.receivedAt < b.receivedAt ? 1 : a.receivedAt > b.receivedAt ? -1 : 0
-  );
+  events.sort((a, b) => (a.receivedAt < b.receivedAt ? 1 : a.receivedAt > b.receivedAt ? -1 : 0));
   if (events.length > MAX_EXPORT) events = events.slice(0, MAX_EXPORT);
 
   const header = ["receivedAt", "id", "hook", "ip", "contentType", "userAgent", "payloadJson"];
@@ -666,6 +661,7 @@ app.get("/dashboard", (req, res) => {
     .list{max-height:72vh;overflow:auto}
     .row{padding:12px 14px;border-bottom:1px solid #202630;cursor:pointer}
     .row:hover{background:#0f1319}
+    .row.active{outline:2px solid #2a3340; outline-offset:-2px}
     .muted{color:#9bb0c2;font-size:12px}
     .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
     pre{margin:0;padding:14px;max-height:72vh;overflow:auto;white-space:pre-wrap;word-break:break-word}
@@ -685,6 +681,7 @@ app.get("/dashboard", (req, res) => {
     .tag b{color:#cfe1f3}
     .summary{margin-top:6px;color:#cfe1f3}
     .sub{margin-top:4px}
+    .rightActions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
     @media (max-width: 980px){ .grid{grid-template-columns:1fr} .list, pre{max-height:45vh} input.search{width:100%} }
   </style>
 </head>
@@ -719,16 +716,19 @@ app.get("/dashboard", (req, res) => {
 
         <div class="kv">
           <label>Limit</label>
-          <input id="limit" type="number" min="0" step="1" value="0" title="0 = unlimited"/>
+          <input id="limit" type="number" min="0" step="1" value="200" title="0 = unlimited (not recommended)"/>
         </div>
 
-        <button id="refresh">Refresh</button>
-        <button id="auto">Auto: ON</button>
+        <div class="rightActions">
+          <button id="refresh">Refresh</button>
+          <button id="auto">Auto: ON</button>
+          <button id="pause">Pause: OFF</button>
 
-        <a class="btn" id="dlNdjson" href="#" download>Download NDJSON</a>
-        <a class="btn" id="dlCsv" href="#" download>Download CSV</a>
+          <a class="btn" id="dlNdjson" href="#" download>Download NDJSON</a>
+          <a class="btn" id="dlCsv" href="#" download>Download CSV</a>
 
-        <button class="danger" id="clearBtn">Clear</button>
+          <button class="danger" id="clearBtn">Clear</button>
+        </div>
       </div>
 
       <div class="muted" style="margin-top:8px">
@@ -763,8 +763,12 @@ app.get("/dashboard", (req, res) => {
 <script>
   let auto = true;
   let timer = null;
+  let paused = false;
+
   let selectedHook = null; // "*" or actual hook
   let currentSelectedJson = null;
+  let currentSelectedId = null;      // keep selection stable during refresh
+  let currentSelectedHook = null;    // keep selection stable during refresh
 
   const qs = new URLSearchParams(location.search);
 
@@ -837,6 +841,8 @@ app.get("/dashboard", (req, res) => {
     sel.onchange = async () => {
       selectedHook = sel.value;
       setHookPill(selectedHook);
+      currentSelectedId = null;
+      currentSelectedHook = null;
       updateUrl();
       updateDownloadLinks();
       await load();
@@ -879,10 +885,19 @@ app.get("/dashboard", (req, res) => {
       updateUrl();
       updateDownloadLinks();
       load();
-    }, 250);
+    }, 350);
+  }
+
+  function setPause(on){
+    paused = on;
+    document.getElementById('pause').textContent = 'Pause: ' + (paused ? 'ON' : 'OFF');
+    if (paused) setStatus('Paused (not refreshing list)');
+    else setStatus('Resuming…');
   }
 
   async function load() {
+    if (paused) return;
+
     const field = getField();
     const value = getValue();
     const q = getQ();
@@ -914,7 +929,16 @@ app.get("/dashboard", (req, res) => {
 
     setCount((data.count || 0) + ' match' + ((data.count || 0) === 1 ? '' : 'es'));
 
+    let firstItem = null;
+    let selectedItem = null;
+
     for (const item of data.items) {
+      if (!firstItem) firstItem = item;
+
+      if (currentSelectedId && currentSelectedHook) {
+        if (item.id === currentSelectedId && item.hook === currentSelectedHook) selectedItem = item;
+      }
+
       const div = document.createElement('div');
       div.className = 'row';
 
@@ -939,18 +963,38 @@ app.get("/dashboard", (req, res) => {
           '</div>' +
         '</div>';
 
-      div.onclick = () => select(item);
+      div.onclick = () => select(item, div);
       list.appendChild(div);
+
+      // mark active row after selection
+      if (currentSelectedId && currentSelectedHook && item.id === currentSelectedId && item.hook === currentSelectedHook) {
+        div.classList.add('active');
+      }
     }
 
-    select(data.items[0]);
+    // keep user selection stable; only auto-select if nothing selected yet
+    if (currentSelectedId && currentSelectedHook && selectedItem) {
+      // keep current selection
+    } else if (!currentSelectedId && firstItem) {
+      select(firstItem, list.firstChild);
+    }
+
     setStatus('Last update: ' + new Date().toLocaleTimeString());
   }
 
-  async function select(item) {
+  async function select(item, clickedDiv) {
+    currentSelectedId = item.id;
+    currentSelectedHook = item.hook;
+
+    // set active row
+    const list = document.getElementById('list');
+    for (const el of list.children) el.classList.remove('active');
+    if (clickedDiv) clickedDiv.classList.add('active');
+
     currentSelectedJson = JSON.stringify(item, null, 2);
     document.getElementById('detail').textContent = currentSelectedJson;
 
+    // If in single-hook mode, fetch canonical item
     if (selectedHook !== '*' && selectedHook) {
       try {
         const res = await fetch('/api/hooks/' + encodeURIComponent(selectedHook) + '/' + encodeURIComponent(item.id), { cache: 'no-store' });
@@ -991,6 +1035,11 @@ app.get("/dashboard", (req, res) => {
     });
     const data = await res.json();
     if (!data.ok) return alert('Clear failed');
+
+    currentSelectedId = null;
+    currentSelectedHook = null;
+    currentSelectedJson = null;
+
     document.getElementById('detail').textContent = 'Select an event…';
     setStatus('Cleared ' + label);
 
@@ -1009,10 +1058,14 @@ app.get("/dashboard", (req, res) => {
 
   document.getElementById('refresh').onclick = load;
   document.getElementById('auto').onclick = () => setAuto(!auto);
+  document.getElementById('pause').onclick = () => setPause(!paused);
+
+  // reduce “slow typing” searches: only reload when you stop typing
   document.getElementById('fieldSelect').onchange = scheduleReload;
   document.getElementById('value').addEventListener('input', scheduleReload);
   document.getElementById('q').addEventListener('input', scheduleReload);
   document.getElementById('limit').addEventListener('input', scheduleReload);
+
   document.getElementById('copyBtn').onclick = copySelected;
   document.getElementById('clearBtn').onclick = clearData;
 
@@ -1023,6 +1076,7 @@ app.get("/dashboard", (req, res) => {
     updateUrl();
     updateDownloadLinks();
     setAuto(true);
+    setPause(false);
     await load();
   })();
 </script>
