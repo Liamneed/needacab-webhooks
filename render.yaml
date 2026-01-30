@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: needacab-webhooks
+    env: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATA_DIR
+        value: /tmp/data
