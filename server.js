@@ -6,8 +6,29 @@ import crypto from "crypto";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// --- request logging (so you can see Autocab hits in Render logs) ---
+app.use((req, res, next) => {
+  console.log(
+    `[REQ] ${req.method} ${req.originalUrl} ct=${req.headers["content-type"] || ""}`
+  );
+  next();
+});
+
 // --- middleware ---
-app.use(express.json({ limit: "2mb" }));
+// Accept JSON when it is JSON
+app.use(
+  express.json({
+    limit: "2mb",
+    type: ["application/json", "application/*+json"],
+  })
+);
+// Also accept raw text for anything else so we don't silently drop Autocab payloads
+app.use(
+  express.text({
+    limit: "2mb",
+    type: "*/*",
+  })
+);
 
 // --- storage ---
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), "data");
@@ -51,7 +72,7 @@ function storeEvent(payload, meta) {
 }
 
 // --- webhook receiver ---
-// Autocab should POST here: https://needacabwebhooks.co.uk/tracks
+// Autocab should POST here: https://autocab.needacabwebhooks.co.uk/tracks
 app.post("/tracks", (req, res) => {
   const meta = {
     ip: req.headers["x-forwarded-for"] || req.socket.remoteAddress,
@@ -59,9 +80,25 @@ app.post("/tracks", (req, res) => {
     contentType: req.headers["content-type"] || null,
   };
 
-  const payload = req.body ?? {};
-  const evt = storeEvent(payload, meta);
+  let payload = req.body;
 
+  // If body arrived as text, try parse JSON; otherwise store raw
+  if (typeof payload === "string") {
+    const trimmed = payload.trim();
+    if (trimmed) {
+      try {
+        payload = JSON.parse(trimmed);
+      } catch {
+        payload = { _raw: payload };
+      }
+    } else {
+      payload = { _empty: true };
+    }
+  }
+
+  if (payload == null) payload = { _empty: true };
+
+  const evt = storeEvent(payload, meta);
   res.status(200).json({ ok: true, id: evt.id });
 });
 
@@ -96,7 +133,6 @@ app.get("/tracks", (req, res) => {
     .row{padding:12px 14px;border-bottom:1px solid #202630;cursor:pointer}
     .row:hover{background:#0f1319}
     .muted{color:#9bb0c2;font-size:12px}
-    .table{width:100%}
     pre{margin:0;padding:14px;max-height:70vh;overflow:auto;white-space:pre-wrap;word-break:break-word}
     .topbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
     button{background:#1b222c;border:1px solid #2a3340;color:#e9eef4;padding:8px 10px;border-radius:10px;cursor:pointer}
@@ -169,18 +205,17 @@ app.get("/tracks", (req, res) => {
         ? Object.keys(item.payload).slice(0, 8).join(', ')
         : '(non-object payload)';
 
-div.innerHTML =
-  '<div style="display:flex;justify-content:space-between;gap:10px">' +
-    '<div>' +
-      '<div><b>' + fmt(item.receivedAt) + '</b></div>' +
-      '<div class="muted">Keys: ' + (keys || '-') + '</div>' +
-    '</div>' +
-    '<div class="muted" style="text-align:right">' +
-      '<div>' + ((item.meta?.ip || '').toString().slice(0, 30)) + '</div>' +
-      '<div>' + (item.meta?.contentType || '') + '</div>' +
-    '</div>' +
-  '</div>';
-
+      div.innerHTML =
+        '<div style="display:flex;justify-content:space-between;gap:10px">' +
+          '<div>' +
+            '<div><b>' + fmt(item.receivedAt) + '</b></div>' +
+            '<div class="muted">Keys: ' + (keys || '-') + '</div>' +
+          '</div>' +
+          '<div class="muted" style="text-align:right">' +
+            '<div>' + ((item.meta?.ip || '').toString().slice(0, 30)) + '</div>' +
+            '<div>' + (item.meta?.contentType || '') + '</div>' +
+          '</div>' +
+        '</div>';
 
       div.onclick = () => select(item.id);
       list.appendChild(div);
@@ -221,6 +256,12 @@ div.innerHTML =
 });
 
 app.get("/", (req, res) => res.redirect("/tracks"));
+
+// body parser errors (invalid JSON etc.)
+app.use((err, req, res, next) => {
+  console.error("[BODY ERROR]", err?.message || err);
+  res.status(400).send("Bad Request");
+});
 
 app.listen(PORT, () => {
   console.log("Need-a-Cab Webhooks listening on", PORT);
