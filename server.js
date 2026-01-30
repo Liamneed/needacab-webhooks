@@ -189,10 +189,7 @@ function parseTokens(q) {
     }
 
     let v = t.trim();
-    if (
-      (v.startsWith('"') && v.endsWith('"')) ||
-      (v.startsWith("'") && v.endsWith("'"))
-    ) {
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
       v = v.slice(1, -1);
     }
     if (v) textTokens.push(v.toLowerCase());
@@ -229,7 +226,6 @@ function eventMatchesTextToken(evt, tokenLower) {
 }
 
 // ---- Path helper for dropdown field search ----
-// Supports selecting "payload.Driver.Callsign" etc
 function getByPath(obj, pathStr) {
   if (!obj || !pathStr) return undefined;
   const parts = pathStr.split(".").filter(Boolean);
@@ -241,10 +237,7 @@ function getByPath(obj, pathStr) {
   return cur;
 }
 
-// ---- New: UI field selector search ----
-// field="any" => search anywhere in the event
-// field="fulltext" => also search anywhere (same behaviour)
-// otherwise field is a JSON path like "payload.Driver.Callsign"
+// ---- UI field selector search ----
 function eventMatchesSelectedField(evt, fieldPath, value) {
   const v = (value || "").toString().trim().toLowerCase();
   if (!v) return true;
@@ -258,9 +251,7 @@ function eventMatchesSelectedField(evt, fieldPath, value) {
   return stringifySafe(got).toLowerCase().includes(v);
 }
 
-// Combined query matcher:
-// - supports dropdown field + value
-// - also supports old q tokens (key:value + free text) for power users
+// Combined query matcher
 function eventMatches(evt, { q, field, value }) {
   if (value && value.trim()) {
     if (!eventMatchesSelectedField(evt, field, value)) return false;
@@ -280,7 +271,6 @@ function eventMatches(evt, { q, field, value }) {
 }
 
 // ---- Summary extraction for list rows ----
-// Updated for Autocab payloads (PascalCase + nested Driver/Vehicle/Pickup/Destination)
 const COMMON_FIELDS = [
   { label: "Booking Id (payload.Id)", path: "payload.Id" },
   { label: "OriginalBookingId", path: "payload.OriginalBookingId" },
@@ -317,61 +307,82 @@ function short(s, n = 80) {
   return t.length > n ? t.slice(0, n) + "…" : t;
 }
 
-/**
- * buildSummary:
- * - Special-cases Autocab "tracks" payloads that include payload.VehicleTracks[]
- * - Otherwise falls back to the standard booking summary.
- */
+function asCleanString(x) {
+  if (x == null) return "";
+  const s = String(x);
+  return s.trim();
+}
+
 function buildSummary(evt) {
   const p = evt?.payload ?? {};
   const parts = [];
+  const meta = {}; // client can render richer UI from this
 
-  // ---- Special handling: TRACKS webhook ----
-  // payload.EventType: "VehicleTracksChanged"
-  // payload.VehicleTracks: [{ BookingId, Vehicle{Id,Callsign}, Driver{Id,Callsign}, VehicleStatus, Timestamp, ... }]
+  // ---- TRACKS (VehicleTracksChanged) special case ----
   const tracks = Array.isArray(p?.VehicleTracks) ? p.VehicleTracks : null;
-  if (tracks && tracks.length) {
-    const eventType = p?.EventType || "VehicleTracks";
-    parts.push(eventType);
-    parts.push(`Tracks: ${tracks.length}`);
+  const isTracks =
+    p?.EventType === "VehicleTracksChanged" ||
+    p?.EventType === "VehicleTracksChangedEvent" ||
+    (tracks && tracks.length > 0);
 
-    // show first N track lines to keep list readable
-    const N = 3;
+  if (isTracks) {
+    const count = tracks ? tracks.length : 0;
+    meta.kind = "tracks";
+    meta.eventType = asCleanString(p?.EventType || "VehicleTracksChanged");
+    meta.tracksCount = count;
 
-    const lines = tracks.slice(0, N).map((t) => {
-      const vc = (t?.Vehicle?.Callsign ?? "").toString().trim();
-      const vid = t?.Vehicle?.Id ?? "";
-      const did = t?.Driver?.Id ?? "";
-      const status = (t?.VehicleStatus ?? "").toString().trim();
-      const bid = t?.BookingId ?? "";
-      const cs = vc || (t?.Driver?.Callsign ?? "").toString().trim();
+    // pick a representative track for the compact summary (first item)
+    const t0 = tracks && tracks.length ? tracks[0] : {};
+    const cs =
+      asCleanString(t0?.Vehicle?.Callsign) ||
+      asCleanString(t0?.Driver?.Callsign);
 
-      const bits = [];
-      if (cs) bits.push(cs);
-      if (vid !== "") bits.push(`V#${vid}`);
-      if (did !== "") bits.push(`D#${did}`);
-      if (status) bits.push(status);
-      if (bid !== "") bits.push(`B${bid}`);
-      return bits.join(" ");
-    });
+    const vId = t0?.Vehicle?.Id ?? "";
+    const dId = t0?.Driver?.Id ?? "";
+    const status = asCleanString(t0?.VehicleStatus || p?.VehicleStatus);
 
-    parts.push(lines.join(" | "));
-    if (tracks.length > N) parts.push(`… +${tracks.length - N}`);
+    // also useful for pills
+    meta.cs = cs;
+    meta.vehicleId = vId === "" ? "" : Number(vId);
+    meta.driverId = dId === "" ? "" : Number(dId);
+    meta.status = status;
 
-    return { summary: parts.join(" | ") };
+    parts.push(meta.eventType);
+    parts.push(`Tracks: ${count}`);
+
+    const rightBits = [];
+    if (cs) rightBits.push(`CS#${cs}`);
+    if (vId !== "" && vId != null) rightBits.push(`V#${vId}`);
+    if (dId !== "" && dId != null) rightBits.push(`D#${dId}`);
+    if (status) rightBits.push(status);
+
+    if (rightBits.length) parts.push(rightBits.join(" "));
+    return { summary: parts.join(" | "), meta };
   }
 
-  // ---- Default booking-ish summary ----
+  // ---- Default (booking-ish) ----
   const id = p.Id ?? p.OriginalBookingId ?? "";
   const eventType = p.EventType ?? "";
   const bookingType = p.BookingType ?? "";
   const typeOfBooking = p.TypeOfBooking ?? "";
 
-  const driverCs = p?.Driver?.Callsign ?? p?.DriverDetails?.Driver?.Callsign ?? "";
-  const driverId = p?.Driver?.Id ?? p?.DriverDetails?.Driver?.Id ?? "";
+  const driverCs =
+    p?.Driver?.Callsign ??
+    p?.DriverDetails?.Driver?.Callsign ??
+    "";
+  const driverId =
+    p?.Driver?.Id ??
+    p?.DriverDetails?.Driver?.Id ??
+    "";
 
-  const vehCs = p?.Vehicle?.Callsign ?? p?.VehicleDetails?.Vehicle?.Callsign ?? "";
-  const vehId = p?.Vehicle?.Id ?? p?.VehicleDetails?.Vehicle?.Id ?? "";
+  const vehCs =
+    p?.Vehicle?.Callsign ??
+    p?.VehicleDetails?.Vehicle?.Callsign ??
+    "";
+  const vehId =
+    p?.Vehicle?.Id ??
+    p?.VehicleDetails?.Vehicle?.Id ??
+    "";
   const reg = p?.Vehicle?.Registration ?? "";
   const plate = p?.Vehicle?.PlateNumber ?? "";
 
@@ -394,25 +405,14 @@ function buildSummary(evt) {
   if (bookingType) parts.push(bookingType);
   if (typeOfBooking) parts.push(typeOfBooking);
 
-const dv = [];
-
-// Prefer Callsign first, always labelled
-if (driverCs) dv.push(`CS#${driverCs}`);
-else if (vehCs) dv.push(`CS#${vehCs}`);
-
-// IDs
-if (vehId !== "") dv.push(`V#${vehId}`);
-if (driverId !== "") dv.push(`D#${driverId}`);
-
-// Vehicle status (TRACKS only)
-const status =
-  p?.VehicleStatus ||
-  p?.VehicleTracks?.[0]?.VehicleStatus;
-
-if (status) dv.push(status);
-
-if (dv.length) parts.push(dv.join(" "));
-
+  const dv = [];
+  if (driverCs) dv.push(`CS#${driverCs}`);
+  if (vehCs && !driverCs) dv.push(`CS#${vehCs}`); // fallback if only vehicle callsign exists
+  if (vehId !== "") dv.push(`V#${vehId}`);
+  if (driverId !== "") dv.push(`D#${driverId}`);
+  if (reg) dv.push(asCleanString(reg));
+  if (plate) dv.push(`Plate ${asCleanString(plate)}`);
+  if (dv.length) parts.push(dv.join(" "));
 
   if (pickupAddr || destAddr) {
     const leg =
@@ -439,7 +439,10 @@ if (dv.length) parts.push(dv.join(" "));
     parts.push(`Keys: ${keys.join(", ")}`);
   }
 
-  return { summary: parts.join(" | ") };
+  meta.kind = "default";
+  meta.eventType = asCleanString(eventType);
+  meta.bookingId = id;
+  return { summary: parts.join(" | "), meta };
 }
 
 // ---- Helpers: limits ----
@@ -526,8 +529,8 @@ app.get("/api/hooks/:hook", (req, res) => {
   }
 
   const items = (limit === 0 ? filtered : filtered.slice(0, Math.min(5000, limit))).map((evt) => {
-    const { summary } = buildSummary(evt);
-    return { ...evt, _summary: summary };
+    const { summary, meta } = buildSummary(evt);
+    return { ...evt, _summary: summary, _summaryMeta: meta };
   });
 
   res.json({
@@ -574,8 +577,8 @@ app.get("/api/events", (req, res) => {
   const sliced = limit === 0 ? filtered : filtered.slice(0, Math.min(5000, limit));
 
   const items = sliced.map((evt) => {
-    const { summary } = buildSummary(evt);
-    return { ...evt, _summary: summary };
+    const { summary, meta } = buildSummary(evt);
+    return { ...evt, _summary: summary, _summaryMeta: meta };
   });
 
   res.json({
@@ -710,7 +713,7 @@ app.get("/dashboard", (req, res) => {
     body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#0b0d10;color:#e9eef4}
     header{padding:16px 18px;border-bottom:1px solid #202630;position:sticky;top:0;background:#0b0d10;z-index:10}
     .wrap{max-width:1600px;margin:0 auto;padding:16px}
-    .grid{display:grid;grid-template-columns:520px 1fr;gap:14px}
+    .grid{display:grid;grid-template-columns:560px 1fr;gap:14px}
     .card{background:#12161c;border:1px solid #202630;border-radius:16px;overflow:hidden}
     .card h3{margin:0;padding:12px 14px;border-bottom:1px solid #202630;font-size:14px;color:#9bb0c2;display:flex;justify-content:space-between;align-items:center;gap:10px}
     .list{max-height:72vh;overflow:auto}
@@ -719,7 +722,8 @@ app.get("/dashboard", (req, res) => {
     .row.active{outline:2px solid #2a3340; outline-offset:-2px}
     .muted{color:#9bb0c2;font-size:12px}
     .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
-    pre{margin:0;padding:14px;max-height:72vh;overflow:auto;white-space:pre-wrap;word-break:break-word}
+    pre{margin:0}
+    .detailWrap{padding:14px;max-height:72vh;overflow:auto}
     .topbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
     button,a.btn{background:#1b222c;border:1px solid #2a3340;color:#e9eef4;padding:8px 10px;border-radius:10px;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:6px}
     button:hover,a.btn:hover{background:#202836}
@@ -727,6 +731,11 @@ app.get("/dashboard", (req, res) => {
     input{width:140px}
     input.search{width:260px}
     .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#1b222c;border:1px solid #2a3340;font-size:12px;color:#cfe1f3}
+    .pill.status{border-color:#2a3340}
+    .pill.s-clear{background:rgba(30, 130, 90, .15);border-color:rgba(30, 130, 90, .35)}
+    .pill.s-busy{background:rgba(220, 165, 35, .14);border-color:rgba(220, 165, 35, .35)}
+    .pill.s-offered{background:rgba(70, 130, 220, .14);border-color:rgba(70, 130, 220, .35)}
+    .pill.s-other{background:rgba(155, 176, 194, .10);border-color:rgba(155, 176, 194, .28)}
     .kv{display:flex;gap:8px;align-items:center}
     .kv label{font-size:12px;color:#9bb0c2}
     .actions{display:flex;gap:8px;flex-wrap:wrap}
@@ -737,7 +746,17 @@ app.get("/dashboard", (req, res) => {
     .summary{margin-top:6px;color:#cfe1f3}
     .sub{margin-top:4px}
     .rightActions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-    @media (max-width: 980px){ .grid{grid-template-columns:1fr} .list, pre{max-height:45vh} input.search{width:100%} }
+    .tabs{display:flex;gap:8px;align-items:center}
+    .tab{padding:6px 10px;border-radius:999px;border:1px solid #2a3340;background:#0f1319;color:#cfe1f3;font-size:12px;cursor:pointer}
+    .tab.active{background:#1b222c}
+    table{width:100%;border-collapse:collapse}
+    th,td{border-bottom:1px solid #202630;padding:8px 6px;text-align:left;vertical-align:top}
+    th{color:#9bb0c2;font-size:12px;font-weight:600;position:sticky;top:0;background:#12161c}
+    td{font-size:13px}
+    a{color:#cfe1f3}
+    a:hover{text-decoration:underline}
+    .delta{font-size:12px;color:#9bb0c2}
+    @media (max-width: 980px){ .grid{grid-template-columns:1fr} .list,.detailWrap{max-height:45vh} input.search{width:100%} }
   </style>
 </head>
 <body>
@@ -805,12 +824,16 @@ app.get("/dashboard", (req, res) => {
 
       <div class="card">
         <h3>
-          <span>Selected payload</span>
+          <span>Selected</span>
           <span class="actions">
+            <span class="tabs">
+              <span class="tab active" id="tabTracks">Tracks</span>
+              <span class="tab" id="tabJson">JSON</span>
+            </span>
             <button id="copyBtn">Copy JSON</button>
           </span>
         </h3>
-        <pre id="detail" class="muted">Select an event…</pre>
+        <div class="detailWrap" id="detail">Select an event…</div>
       </div>
     </div>
   </div>
@@ -825,9 +848,15 @@ app.get("/dashboard", (req, res) => {
   let currentSelectedId = null;      // keep selection stable during refresh
   let currentSelectedHook = null;    // keep selection stable during refresh
 
+  let viewMode = "tracks"; // tracks | json
+
+  // Delta memory (browser-side): vehicleId -> last seen
+  const lastByVehicleId = new Map();
+
   const qs = new URLSearchParams(location.search);
 
   function fmt(s){ try { return new Date(s).toLocaleString(); } catch { return s; } }
+  function esc(s){ return String(s ?? "").replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
   function setStatus(txt){ document.getElementById('status').textContent = txt; }
   function setCount(txt){ document.getElementById('count').textContent = txt || ''; }
   function setHookPill(h){ document.getElementById('hookPill').textContent = (h === '*') ? '* ALL' : '/' + (h || ''); }
@@ -836,6 +865,16 @@ app.get("/dashboard", (req, res) => {
   function getField(){ return document.getElementById('fieldSelect').value || 'any'; }
   function getValue(){ return (document.getElementById('value').value || '').trim(); }
   function getQ(){ return (document.getElementById('q').value || '').trim(); }
+
+  function statusClass(status){
+    const s = String(status || '').toLowerCase();
+    if (!s) return "s-other";
+    if (s === "clear") return "s-clear";
+    if (s.includes("busy")) return "s-busy";
+    if (s.includes("offered")) return "s-offered";
+    if (s.includes("joboffered")) return "s-offered";
+    return "s-other";
+  }
 
   function updateUrl(){
     const u = new URL(location.href);
@@ -950,6 +989,107 @@ app.get("/dashboard", (req, res) => {
     else setStatus('Resuming…');
   }
 
+  function setView(mode){
+    viewMode = mode;
+    document.getElementById('tabTracks').classList.toggle('active', viewMode === 'tracks');
+    document.getElementById('tabJson').classList.toggle('active', viewMode === 'json');
+    // re-render current selection
+    if (currentSelectedJson) renderDetailFromCurrent();
+  }
+
+  function renderTracksDetail(item){
+    const p = item?.payload || {};
+    const tracks = Array.isArray(p.VehicleTracks) ? p.VehicleTracks : [];
+    if (!tracks.length) {
+      return '<div class="muted">No VehicleTracks array in this payload.</div>';
+    }
+
+    // Build rows + delta updates
+    let html = '';
+    html += '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px">';
+    html += '<span class="pill">' + esc(p.EventType || 'VehicleTracksChanged') + '</span>';
+    html += '<span class="pill">Tracks: ' + tracks.length + '</span>';
+    html += '<span class="muted">Received: ' + esc(fmt(item.receivedAt)) + '</span>';
+    html += '</div>';
+
+    html += '<table>';
+    html += '<thead><tr>';
+    html += '<th>CS</th><th>V#</th><th>D#</th><th>Status</th><th>BookingId</th><th>Time</th><th>Loc</th><th>Δ</th>';
+    html += '</tr></thead>';
+    html += '<tbody>';
+
+    for (const tr of tracks) {
+      const cs = (tr?.Vehicle?.Callsign ?? tr?.Driver?.Callsign ?? '').toString().trim();
+      const vId = tr?.Vehicle?.Id ?? '';
+      const dId = tr?.Driver?.Id ?? '';
+      const st = (tr?.VehicleStatus ?? '').toString().trim();
+      const bId = (tr?.BookingId ?? '').toString().trim();
+      const ts = (tr?.Timestamp ?? '').toString().trim();
+      const lat = tr?.CurrentLocation?.Latitude;
+      const lng = tr?.CurrentLocation?.Longitude;
+
+      // Delta compare
+      const key = vId !== '' && vId != null ? String(vId) : ('cs:' + cs);
+      const prev = lastByVehicleId.get(key);
+      const changes = [];
+      if (prev) {
+        if (String(prev.status || '') !== String(st || '')) changes.push('status');
+        if (String(prev.bookingId || '') !== String(bId || '')) changes.push('booking');
+        if (lat != null && lng != null) {
+          const dLat = Math.abs((prev.lat ?? lat) - lat);
+          const dLng = Math.abs((prev.lng ?? lng) - lng);
+          if (dLat > 0.0003 || dLng > 0.0003) changes.push('moved');
+        }
+      } else {
+        changes.push('new');
+      }
+
+      // update last seen
+      lastByVehicleId.set(key, { status: st, bookingId: bId, lat, lng, ts });
+
+      const mapsUrl =
+        (lat != null && lng != null)
+          ? ('https://www.google.com/maps?q=' + encodeURIComponent(lat + ',' + lng))
+          : '';
+
+      html += '<tr>';
+      html += '<td><span class="pill">CS#' + esc(cs || '-') + '</span></td>';
+      html += '<td>' + esc(vId === '' ? '-' : ('V#' + vId)) + '</td>';
+      html += '<td>' + esc(dId === '' ? '-' : ('D#' + dId)) + '</td>';
+      html += '<td><span class="pill status ' + statusClass(st) + '">' + esc(st || '-') + '</span></td>';
+      html += '<td class="mono">' + esc(bId || '-') + '</td>';
+      html += '<td class="muted">' + esc(ts || '-') + '</td>';
+      html += '<td>' + (mapsUrl ? ('<a target="_blank" rel="noreferrer" href="' + mapsUrl + '">Map</a>') : '<span class="muted">-</span>') + '</td>';
+      html += '<td class="delta">' + esc(changes.join(', ')) + '</td>';
+      html += '</tr>';
+    }
+
+    html += '</tbody></table>';
+    html += '<div class="muted" style="margin-top:10px">Δ compares each vehicle to the last seen state in this browser session.</div>';
+    return html;
+  }
+
+  function renderJsonDetail(){
+    return '<pre class="mono" style="white-space:pre-wrap;word-break:break-word;margin:0">' + esc(currentSelectedJson) + '</pre>';
+  }
+
+  function renderDetailFromCurrent(){
+    try {
+      const item = JSON.parse(currentSelectedJson);
+      const isTracks = item?.payload && Array.isArray(item.payload.VehicleTracks);
+      if (viewMode === "tracks" && isTracks) {
+        document.getElementById('detail').innerHTML = renderTracksDetail(item);
+      } else if (viewMode === "tracks" && !isTracks) {
+        document.getElementById('detail').innerHTML =
+          '<div class="muted">Not a tracks payload. Switch to JSON view.</div>';
+      } else {
+        document.getElementById('detail').innerHTML = renderJsonDetail();
+      }
+    } catch {
+      document.getElementById('detail').innerHTML = renderJsonDetail();
+    }
+  }
+
   async function load() {
     if (paused) return;
 
@@ -1002,19 +1142,29 @@ app.get("/dashboard", (req, res) => {
         : '(non-object payload)';
 
       const summary = item._summary || ('Keys: ' + (keys || '-'));
+      const meta = item._summaryMeta || {};
+      const isTracks = meta.kind === "tracks";
+
+      // Add status pill for tracks in list
+      let rightPills = '';
+      if (isTracks) {
+        const st = meta.status || '';
+        if (st) rightPills += '<span class="pill status ' + statusClass(st) + '">' + esc(st) + '</span>';
+      }
 
       div.innerHTML =
-        '<div style="display:flex;justify-content:space-between;gap:10px">' +
+        '<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start">' +
           '<div>' +
-            '<div class="tag"><b>' + fmt(item.receivedAt) + '</b>' +
-              '<span class="pill" style="margin-left:8px">' + (item.hook ? ('/' + item.hook) : '') + '</span>' +
+            '<div class="tag"><b>' + esc(fmt(item.receivedAt)) + '</b>' +
+              '<span class="pill" style="margin-left:8px">' + esc(item.hook ? ('/' + item.hook) : '') + '</span>' +
             '</div>' +
-            '<div class="summary mono">' + summary.replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</div>' +
-            '<div class="muted sub">Keys: ' + (keys || '-') + '</div>' +
+            '<div class="summary mono">' + esc(summary) + '</div>' +
+            '<div class="muted sub">Keys: ' + esc(keys || '-') + '</div>' +
           '</div>' +
-          '<div class="muted" style="text-align:right">' +
-            '<div>' + ((item.meta?.ip || '').toString().slice(0, 30)) + '</div>' +
-            '<div>' + (item.meta?.contentType || '') + '</div>' +
+          '<div class="muted" style="text-align:right;min-width:140px">' +
+            (rightPills ? ('<div style="margin-bottom:6px">' + rightPills + '</div>') : '') +
+            '<div>' + esc(((item.meta?.ip || '').toString().slice(0, 30))) + '</div>' +
+            '<div>' + esc((item.meta?.contentType || '')) + '</div>' +
           '</div>' +
         '</div>';
 
@@ -1026,6 +1176,7 @@ app.get("/dashboard", (req, res) => {
       }
     }
 
+    // keep user selection stable; only auto-select if nothing selected yet
     if (currentSelectedId && currentSelectedHook && selectedItem) {
       // keep current selection
     } else if (!currentSelectedId && firstItem) {
@@ -1039,23 +1190,25 @@ app.get("/dashboard", (req, res) => {
     currentSelectedId = item.id;
     currentSelectedHook = item.hook;
 
+    // set active row
     const list = document.getElementById('list');
     for (const el of list.children) el.classList.remove('active');
     if (clickedDiv) clickedDiv.classList.add('active');
 
     currentSelectedJson = JSON.stringify(item, null, 2);
-    document.getElementById('detail').textContent = currentSelectedJson;
 
+    // If in single-hook mode, fetch canonical item
     if (selectedHook !== '*' && selectedHook) {
       try {
         const res = await fetch('/api/hooks/' + encodeURIComponent(selectedHook) + '/' + encodeURIComponent(item.id), { cache: 'no-store' });
         const data = await res.json();
         if (data.ok && data.item) {
           currentSelectedJson = JSON.stringify(data.item, null, 2);
-          document.getElementById('detail').textContent = currentSelectedJson;
         }
       } catch {}
     }
+
+    renderDetailFromCurrent();
   }
 
   async function copySelected(){
@@ -1091,7 +1244,7 @@ app.get("/dashboard", (req, res) => {
     currentSelectedHook = null;
     currentSelectedJson = null;
 
-    document.getElementById('detail').textContent = 'Select an event…';
+    document.getElementById('detail').innerHTML = 'Select an event…';
     setStatus('Cleared ' + label);
 
     await loadHooks();
@@ -1111,6 +1264,10 @@ app.get("/dashboard", (req, res) => {
   document.getElementById('auto').onclick = () => setAuto(!auto);
   document.getElementById('pause').onclick = () => setPause(!paused);
 
+  document.getElementById('tabTracks').onclick = () => setView("tracks");
+  document.getElementById('tabJson').onclick = () => setView("json");
+
+  // reduce “slow typing” searches: only reload when you stop typing
   document.getElementById('fieldSelect').onchange = scheduleReload;
   document.getElementById('value').addEventListener('input', scheduleReload);
   document.getElementById('q').addEventListener('input', scheduleReload);
@@ -1127,6 +1284,7 @@ app.get("/dashboard", (req, res) => {
     updateDownloadLinks();
     setAuto(true);
     setPause(false);
+    setView("tracks");
     await load();
   })();
 </script>
