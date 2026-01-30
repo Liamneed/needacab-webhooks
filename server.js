@@ -189,7 +189,10 @@ function parseTokens(q) {
     }
 
     let v = t.trim();
-    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+    if (
+      (v.startsWith('"') && v.endsWith('"')) ||
+      (v.startsWith("'") && v.endsWith("'"))
+    ) {
       v = v.slice(1, -1);
     }
     if (v) textTokens.push(v.toLowerCase());
@@ -314,10 +317,51 @@ function short(s, n = 80) {
   return t.length > n ? t.slice(0, n) + "…" : t;
 }
 
+/**
+ * buildSummary:
+ * - Special-cases Autocab "tracks" payloads that include payload.VehicleTracks[]
+ * - Otherwise falls back to the standard booking summary.
+ */
 function buildSummary(evt) {
   const p = evt?.payload ?? {};
   const parts = [];
 
+  // ---- Special handling: TRACKS webhook ----
+  // payload.EventType: "VehicleTracksChanged"
+  // payload.VehicleTracks: [{ BookingId, Vehicle{Id,Callsign}, Driver{Id,Callsign}, VehicleStatus, Timestamp, ... }]
+  const tracks = Array.isArray(p?.VehicleTracks) ? p.VehicleTracks : null;
+  if (tracks && tracks.length) {
+    const eventType = p?.EventType || "VehicleTracks";
+    parts.push(eventType);
+    parts.push(`Tracks: ${tracks.length}`);
+
+    // show first N track lines to keep list readable
+    const N = 3;
+
+    const lines = tracks.slice(0, N).map((t) => {
+      const vc = (t?.Vehicle?.Callsign ?? "").toString().trim();
+      const vid = t?.Vehicle?.Id ?? "";
+      const did = t?.Driver?.Id ?? "";
+      const status = (t?.VehicleStatus ?? "").toString().trim();
+      const bid = t?.BookingId ?? "";
+      const cs = vc || (t?.Driver?.Callsign ?? "").toString().trim();
+
+      const bits = [];
+      if (cs) bits.push(cs);
+      if (vid !== "") bits.push(`V#${vid}`);
+      if (did !== "") bits.push(`D#${did}`);
+      if (status) bits.push(status);
+      if (bid !== "") bits.push(`B${bid}`);
+      return bits.join(" ");
+    });
+
+    parts.push(lines.join(" | "));
+    if (tracks.length > N) parts.push(`… +${tracks.length - N}`);
+
+    return { summary: parts.join(" | ") };
+  }
+
+  // ---- Default booking-ish summary ----
   const id = p.Id ?? p.OriginalBookingId ?? "";
   const eventType = p.EventType ?? "";
   const bookingType = p.BookingType ?? "";
@@ -966,13 +1010,11 @@ app.get("/dashboard", (req, res) => {
       div.onclick = () => select(item, div);
       list.appendChild(div);
 
-      // mark active row after selection
       if (currentSelectedId && currentSelectedHook && item.id === currentSelectedId && item.hook === currentSelectedHook) {
         div.classList.add('active');
       }
     }
 
-    // keep user selection stable; only auto-select if nothing selected yet
     if (currentSelectedId && currentSelectedHook && selectedItem) {
       // keep current selection
     } else if (!currentSelectedId && firstItem) {
@@ -986,7 +1028,6 @@ app.get("/dashboard", (req, res) => {
     currentSelectedId = item.id;
     currentSelectedHook = item.hook;
 
-    // set active row
     const list = document.getElementById('list');
     for (const el of list.children) el.classList.remove('active');
     if (clickedDiv) clickedDiv.classList.add('active');
@@ -994,7 +1035,6 @@ app.get("/dashboard", (req, res) => {
     currentSelectedJson = JSON.stringify(item, null, 2);
     document.getElementById('detail').textContent = currentSelectedJson;
 
-    // If in single-hook mode, fetch canonical item
     if (selectedHook !== '*' && selectedHook) {
       try {
         const res = await fetch('/api/hooks/' + encodeURIComponent(selectedHook) + '/' + encodeURIComponent(item.id), { cache: 'no-store' });
@@ -1060,7 +1100,6 @@ app.get("/dashboard", (req, res) => {
   document.getElementById('auto').onclick = () => setAuto(!auto);
   document.getElementById('pause').onclick = () => setPause(!paused);
 
-  // reduce “slow typing” searches: only reload when you stop typing
   document.getElementById('fieldSelect').onchange = scheduleReload;
   document.getElementById('value').addEventListener('input', scheduleReload);
   document.getElementById('q').addEventListener('input', scheduleReload);
