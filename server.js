@@ -6,23 +6,39 @@ import crypto from "crypto";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- request logging (so you can see Autocab hits in Render logs) ---
+// ---- Config ----
+const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), "data");
+const MAX_RECENT_PER_HOOK = Number(process.env.MAX_RECENT_PER_HOOK || 500);
+
+// Optional allowlist: comma-separated hook names, e.g. "tracks,modify,cancel"
+const HOOK_ALLOWLIST = (process.env.HOOK_ALLOWLIST || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+function isHookAllowed(hook) {
+  if (!hook) return false;
+  // keep it simple + safe: only allow letters, numbers, dash, underscore
+  if (!/^[a-zA-Z0-9_-]{1,40}$/.test(hook)) return false;
+  if (HOOK_ALLOWLIST.length === 0) return true; // allow all if not set
+  return HOOK_ALLOWLIST.includes(hook);
+}
+
+fs.mkdirSync(DATA_DIR, { recursive: true });
+
+// ---- Request logging ----
 app.use((req, res, next) => {
-  console.log(
-    `[REQ] ${req.method} ${req.originalUrl} ct=${req.headers["content-type"] || ""}`
-  );
+  console.log(`[REQ] ${req.method} ${req.originalUrl} ct=${req.headers["content-type"] || ""}`);
   next();
 });
 
-// --- middleware ---
-// Accept JSON when it is JSON
+// ---- Body parsing: accept JSON or any text ----
 app.use(
   express.json({
     limit: "2mb",
     type: ["application/json", "application/*+json"],
   })
 );
-// Also accept raw text for anything else so we don't silently drop Autocab payloads
 app.use(
   express.text({
     limit: "2mb",
@@ -30,50 +46,80 @@ app.use(
   })
 );
 
-// --- storage ---
-const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), "data");
-const STORE_FILE = path.join(DATA_DIR, "tracks.ndjson");
-fs.mkdirSync(DATA_DIR, { recursive: true });
+// ---- Storage (per hook) ----
+// In-memory: { [hook]: [events...] }
+const recentByHook = new Map();
 
-let recent = [];
-const MAX_RECENT = 500;
-
-// load last N events from disk on boot
-if (fs.existsSync(STORE_FILE)) {
-  const raw = fs.readFileSync(STORE_FILE, "utf8").trim();
-  if (raw) {
-    const lines = raw.split("\n").filter(Boolean);
-    const tail = lines.slice(-MAX_RECENT);
-    recent = tail
-      .map((l) => {
-        try {
-          return JSON.parse(l);
-        } catch {
-          return null;
-        }
-      })
-      .filter(Boolean);
-  }
+// Load persisted NDJSON files on boot
+function hookFile(hook) {
+  return path.join(DATA_DIR, `${hook}.ndjson`);
 }
 
-function storeEvent(payload, meta) {
+function loadHook(hook) {
+  const file = hookFile(hook);
+  if (!fs.existsSync(file)) return [];
+  const raw = fs.readFileSync(file, "utf8").trim();
+  if (!raw) return [];
+  const lines = raw.split("\n").filter(Boolean);
+  const tail = lines.slice(-MAX_RECENT_PER_HOOK);
+  return tail
+    .map((l) => {
+      try {
+        return JSON.parse(l);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+function ensureHookLoaded(hook) {
+  if (!recentByHook.has(hook)) {
+    recentByHook.set(hook, loadHook(hook));
+  }
+  return recentByHook.get(hook);
+}
+
+function storeEvent(hook, payload, meta) {
   const evt = {
     id: crypto.randomUUID(),
+    hook,
     receivedAt: new Date().toISOString(),
     meta,
     payload,
   };
 
-  recent.unshift(evt);
-  if (recent.length > MAX_RECENT) recent.pop();
+  const arr = ensureHookLoaded(hook);
+  arr.unshift(evt);
+  if (arr.length > MAX_RECENT_PER_HOOK) arr.pop();
 
-  fs.appendFileSync(STORE_FILE, JSON.stringify(evt) + "\n");
+  fs.appendFileSync(hookFile(hook), JSON.stringify(evt) + "\n");
   return evt;
 }
 
-// --- webhook receiver ---
-// Autocab should POST here: https://autocab.needacabwebhooks.co.uk/tracks
-app.post("/tracks", (req, res) => {
+function listHooksOnDisk() {
+  try {
+    const files = fs.readdirSync(DATA_DIR);
+    const hooks = files
+      .filter((f) => f.endsWith(".ndjson"))
+      .map((f) => f.replace(/\.ndjson$/, ""))
+      .filter((h) => isHookAllowed(h));
+    hooks.sort((a, b) => a.localeCompare(b));
+    return hooks;
+  } catch {
+    return [];
+  }
+}
+
+// ---- Webhook receiver (ANY hook) ----
+// Autocab can POST to: /tracks, /modify, /cancel, etc.
+app.post("/:hook", (req, res) => {
+  const hook = (req.params.hook || "").trim();
+
+  if (!isHookAllowed(hook)) {
+    return res.status(404).json({ ok: false, error: "Unknown webhook" });
+  }
+
   const meta = {
     ip: req.headers["x-forwarded-for"] || req.socket.remoteAddress,
     userAgent: req.headers["user-agent"] || null,
@@ -98,47 +144,65 @@ app.post("/tracks", (req, res) => {
 
   if (payload == null) payload = { _empty: true };
 
-  const evt = storeEvent(payload, meta);
-  res.status(200).json({ ok: true, id: evt.id });
+  const evt = storeEvent(hook, payload, meta);
+  res.status(200).json({ ok: true, id: evt.id, hook: evt.hook });
 });
 
-// --- API for dashboard ---
-app.get("/api/tracks", (req, res) => {
+// ---- API ----
+app.get("/api/hooks", (req, res) => {
+  const hooks = listHooksOnDisk();
+  res.json({ ok: true, hooks });
+});
+
+app.get("/api/hooks/:hook", (req, res) => {
+  const hook = (req.params.hook || "").trim();
+  if (!isHookAllowed(hook)) return res.status(404).json({ ok: false, error: "Not found" });
+
   const limit = Math.max(1, Math.min(200, Number(req.query.limit || 50)));
-  res.json({ ok: true, count: recent.length, items: recent.slice(0, limit) });
+  const arr = ensureHookLoaded(hook);
+  res.json({ ok: true, hook, count: arr.length, items: arr.slice(0, limit) });
 });
 
-app.get("/api/tracks/:id", (req, res) => {
-  const item = recent.find((x) => x.id === req.params.id);
+app.get("/api/hooks/:hook/:id", (req, res) => {
+  const hook = (req.params.hook || "").trim();
+  if (!isHookAllowed(hook)) return res.status(404).json({ ok: false, error: "Not found" });
+
+  const arr = ensureHookLoaded(hook);
+  const item = arr.find((x) => x.id === req.params.id);
   if (!item) return res.status(404).json({ ok: false, error: "Not found" });
   res.json({ ok: true, item });
 });
 
-// --- viewer page ---
-app.get("/tracks", (req, res) => {
+// ---- Dashboard (single UI for all hooks) ----
+app.get("/", (req, res) => res.redirect("/dashboard"));
+
+app.get("/dashboard", (req, res) => {
   res.type("html").send(`<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Need-a-Cab Webhooks · Tracks</title>
+  <title>Need-a-Cab Webhooks · Dashboard</title>
   <style>
     body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#0b0d10;color:#e9eef4}
-    header{padding:16px 18px;border-bottom:1px solid #202630;position:sticky;top:0;background:#0b0d10}
-    .wrap{max-width:1200px;margin:0 auto;padding:16px}
+    header{padding:16px 18px;border-bottom:1px solid #202630;position:sticky;top:0;background:#0b0d10;z-index:10}
+    .wrap{max-width:1300px;margin:0 auto;padding:16px}
     .grid{display:grid;grid-template-columns:420px 1fr;gap:14px}
     .card{background:#12161c;border:1px solid #202630;border-radius:16px;overflow:hidden}
     .card h3{margin:0;padding:12px 14px;border-bottom:1px solid #202630;font-size:14px;color:#9bb0c2}
-    .list{max-height:70vh;overflow:auto}
+    .list{max-height:72vh;overflow:auto}
     .row{padding:12px 14px;border-bottom:1px solid #202630;cursor:pointer}
     .row:hover{background:#0f1319}
     .muted{color:#9bb0c2;font-size:12px}
-    pre{margin:0;padding:14px;max-height:70vh;overflow:auto;white-space:pre-wrap;word-break:break-word}
+    pre{margin:0;padding:14px;max-height:72vh;overflow:auto;white-space:pre-wrap;word-break:break-word}
     .topbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
     button{background:#1b222c;border:1px solid #2a3340;color:#e9eef4;padding:8px 10px;border-radius:10px;cursor:pointer}
     button:hover{background:#202836}
-    input{background:#0f1319;border:1px solid #2a3340;color:#e9eef4;padding:8px 10px;border-radius:10px;width:120px}
+    input,select{background:#0f1319;border:1px solid #2a3340;color:#e9eef4;padding:8px 10px;border-radius:10px}
+    input{width:120px}
     .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#1b222c;border:1px solid #2a3340;font-size:12px;color:#cfe1f3}
+    .kv{display:flex;gap:10px;align-items:center}
+    .kv label{font-size:12px;color:#9bb0c2}
     @media (max-width: 980px){ .grid{grid-template-columns:1fr} .list, pre{max-height:45vh} }
   </style>
 </head>
@@ -146,14 +210,27 @@ app.get("/tracks", (req, res) => {
   <header>
     <div class="wrap">
       <div class="topbar">
-        <div style="font-weight:700">Need-a-Cab Webhooks</div>
-        <span class="pill">/tracks</span>
+        <div style="font-weight:800">Need-a-Cab Webhooks</div>
+        <span class="pill" id="hookPill">loading…</span>
         <span class="muted" id="status">Loading…</span>
         <div style="flex:1"></div>
-        <label class="muted">Limit</label>
-        <input id="limit" type="number" min="1" max="200" value="50"/>
+
+        <div class="kv">
+          <label>Webhook</label>
+          <select id="hookSelect"></select>
+        </div>
+
+        <div class="kv">
+          <label>Limit</label>
+          <input id="limit" type="number" min="1" max="200" value="50"/>
+        </div>
+
         <button id="refresh">Refresh</button>
         <button id="auto">Auto: ON</button>
+      </div>
+      <div class="muted" style="margin-top:8px">
+        Receiver endpoints: <span class="pill">POST /{hook}</span>
+        e.g. <span class="pill">/tracks</span> <span class="pill">/modify</span>
       </div>
     </div>
   </header>
@@ -161,13 +238,13 @@ app.get("/tracks", (req, res) => {
   <div class="wrap">
     <div class="grid">
       <div class="card">
-        <h3>Latest payloads</h3>
+        <h3>Latest payloads (selected webhook)</h3>
         <div class="list" id="list"></div>
       </div>
 
       <div class="card">
         <h3>Selected payload</h3>
-        <pre id="detail" class="muted">Click an item to view its JSON…</pre>
+        <pre id="detail" class="muted">Select a webhook and click an event…</pre>
       </div>
     </div>
   </div>
@@ -176,23 +253,68 @@ app.get("/tracks", (req, res) => {
   let auto = true;
   let timer = null;
   let selectedId = null;
+  let selectedHook = null;
 
+  const qs = new URLSearchParams(location.search);
   function fmt(s){ try { return new Date(s).toLocaleString(); } catch { return s; } }
 
-  async function load() {
-    const limit = Math.max(1, Math.min(200, Number(document.getElementById('limit').value || 50)));
-    const status = document.getElementById('status');
-    status.textContent = 'Refreshing…';
+  function setStatus(txt){ document.getElementById('status').textContent = txt; }
+  function setHookPill(h){ document.getElementById('hookPill').textContent = '/' + (h || ''); }
 
-    const res = await fetch('/api/tracks?limit=' + limit, { cache: 'no-store' });
+  async function loadHooks() {
+    const res = await fetch('/api/hooks', { cache: 'no-store' });
+    const data = await res.json();
+    const hooks = (data && data.ok && data.hooks) ? data.hooks : [];
+
+    const sel = document.getElementById('hookSelect');
+    sel.innerHTML = '';
+
+    if (!hooks.length) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = 'No hooks yet (send one)';
+      sel.appendChild(opt);
+      return;
+    }
+
+    for (const h of hooks) {
+      const opt = document.createElement('option');
+      opt.value = h;
+      opt.textContent = '/' + h;
+      sel.appendChild(opt);
+    }
+
+    const fromUrl = qs.get('hook');
+    selectedHook = fromUrl && hooks.includes(fromUrl) ? fromUrl : (hooks[0] || null);
+    sel.value = selectedHook || '';
+    setHookPill(selectedHook);
+
+    sel.onchange = () => {
+      selectedHook = sel.value;
+      selectedId = null;
+      setHookPill(selectedHook);
+      const u = new URL(location.href);
+      u.searchParams.set('hook', selectedHook);
+      history.replaceState({}, '', u);
+      load();
+    };
+  }
+
+  async function load() {
+    if (!selectedHook) { setStatus('No hooks yet'); return; }
+
+    const limit = Math.max(1, Math.min(200, Number(document.getElementById('limit').value || 50)));
+    setStatus('Refreshing…');
+
+    const res = await fetch('/api/hooks/' + encodeURIComponent(selectedHook) + '?limit=' + limit, { cache: 'no-store' });
     const data = await res.json();
 
     const list = document.getElementById('list');
     list.innerHTML = '';
 
     if (!data.ok || !data.items?.length) {
-      list.innerHTML = '<div class="row"><div>No payloads received yet.</div><div class="muted">Autocab needs to POST to /tracks</div></div>';
-      status.textContent = 'Ready';
+      list.innerHTML = '<div class="row"><div>No payloads for this webhook yet.</div><div class="muted">Autocab needs to POST to /' + selectedHook + '</div></div>';
+      setStatus('Ready');
       return;
     }
 
@@ -202,7 +324,7 @@ app.get("/tracks", (req, res) => {
       div.dataset.id = item.id;
 
       const keys = item.payload && typeof item.payload === 'object'
-        ? Object.keys(item.payload).slice(0, 8).join(', ')
+        ? Object.keys(item.payload).slice(0, 10).join(', ')
         : '(non-object payload)';
 
       div.innerHTML =
@@ -222,19 +344,15 @@ app.get("/tracks", (req, res) => {
     }
 
     if (!selectedId && data.items[0]) select(data.items[0].id);
-
-    status.textContent = 'Last update: ' + new Date().toLocaleTimeString();
+    setStatus('Last update: ' + new Date().toLocaleTimeString());
   }
 
   async function select(id) {
     selectedId = id;
-    const res = await fetch('/api/tracks/' + id, { cache: 'no-store' });
+    const res = await fetch('/api/hooks/' + encodeURIComponent(selectedHook) + '/' + encodeURIComponent(id), { cache: 'no-store' });
     const data = await res.json();
     const detail = document.getElementById('detail');
-    if (!data.ok) {
-      detail.textContent = 'Not found.';
-      return;
-    }
+    if (!data.ok) { detail.textContent = 'Not found.'; return; }
     detail.textContent = JSON.stringify(data.item, null, 2);
   }
 
@@ -248,14 +366,15 @@ app.get("/tracks", (req, res) => {
   document.getElementById('refresh').onclick = load;
   document.getElementById('auto').onclick = () => setAuto(!auto);
 
-  setAuto(true);
-  load();
+  (async function init(){
+    await loadHooks();
+    setAuto(true);
+    await load();
+  })();
 </script>
 </body>
 </html>`);
 });
-
-app.get("/", (req, res) => res.redirect("/tracks"));
 
 // body parser errors (invalid JSON etc.)
 app.use((err, req, res, next) => {
