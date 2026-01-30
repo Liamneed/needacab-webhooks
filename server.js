@@ -394,14 +394,25 @@ function buildSummary(evt) {
   if (bookingType) parts.push(bookingType);
   if (typeOfBooking) parts.push(typeOfBooking);
 
-  const dv = [];
-  if (driverCs) dv.push(`D CS ${driverCs}`);
-  if (driverId !== "") dv.push(`D#${driverId}`);
-  if (vehCs) dv.push(`V CS ${vehCs}`);
-  if (vehId !== "") dv.push(`V#${vehId}`);
-  if (reg) dv.push(reg);
-  if (plate) dv.push(`Plate ${plate}`);
-  if (dv.length) parts.push(dv.join(" "));
+const dv = [];
+
+// Prefer Callsign first, always labelled
+if (driverCs) dv.push(`CS#${driverCs}`);
+else if (vehCs) dv.push(`CS#${vehCs}`);
+
+// IDs
+if (vehId !== "") dv.push(`V#${vehId}`);
+if (driverId !== "") dv.push(`D#${driverId}`);
+
+// Vehicle status (TRACKS only)
+const status =
+  p?.VehicleStatus ||
+  p?.VehicleTracks?.[0]?.VehicleStatus;
+
+if (status) dv.push(status);
+
+if (dv.length) parts.push(dv.join(" "));
+
 
   if (pickupAddr || destAddr) {
     const leg =
